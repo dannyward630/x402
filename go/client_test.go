@@ -531,7 +531,10 @@ func TestClientNetworkPatternMatching(t *testing.T) {
 
 // mockFailableV1 and mockFailableV2 support failure simulation for hook tests
 
-type mockFailableV1 struct{ fail bool }
+type mockFailableV1 struct {
+	fail        bool
+	createCalls int
+}
 
 func (m *mockFailableV1) Scheme() string { return "mock" }
 func (m *mockFailableV1) CreatePaymentPayload(
@@ -539,13 +542,22 @@ func (m *mockFailableV1) CreatePaymentPayload(
 	_ types.PaymentRequirementsV1,
 	_ PaymentPayloadContext,
 ) (types.PaymentPayloadV1, error) {
+	m.createCalls++
 	if m.fail {
 		return types.PaymentPayloadV1{}, fmt.Errorf("fail")
 	}
-	return types.PaymentPayloadV1{}, nil
+	return types.PaymentPayloadV1{
+		X402Version: 1,
+		Scheme:      "mock",
+		Network:     "test",
+		Payload:     map[string]interface{}{"signature": "mock"},
+	}, nil
 }
 
-type mockFailableV2 struct{ fail bool }
+type mockFailableV2 struct {
+	fail        bool
+	createCalls int
+}
 
 func (m *mockFailableV2) Scheme() string { return "mock" }
 func (m *mockFailableV2) CreatePaymentPayload(
@@ -553,10 +565,24 @@ func (m *mockFailableV2) CreatePaymentPayload(
 	_ types.PaymentRequirements,
 	_ PaymentPayloadContext,
 ) (types.PaymentPayload, error) {
+	m.createCalls++
 	if m.fail {
 		return types.PaymentPayload{}, fmt.Errorf("fail")
 	}
-	return types.PaymentPayload{}, nil
+	return types.PaymentPayload{
+		X402Version: 2,
+		Payload:     map[string]interface{}{"signature": "mock"},
+	}, nil
+}
+
+type mockCreationFailureHandlerV2 struct {
+	mockFailableV2
+	failureHandlerCalls int
+}
+
+func (m *mockCreationFailureHandlerV2) OnPaymentCreationFailure(context.Context, PaymentCreationFailureContext) (*PaymentCreationFailureHookResult, error) {
+	m.failureHandlerCalls++
+	return nil, nil
 }
 
 func TestPaymentHooksOrder_V1_vs_V2(t *testing.T) {
@@ -624,6 +650,120 @@ func TestPaymentHooksOrder_V1_vs_V2(t *testing.T) {
 		require.Equal(t, []string{"before", "failure"}, v2)
 		require.Equal(t, v1, v2)
 	})
+}
+
+func TestAfterPaymentCreationHookErrors(t *testing.T) {
+	newV1 := func() (*x402Client, func() int, func() (PaymentPayloadView, error)) {
+		scheme := &mockFailableV1{}
+		client := Newx402Client()
+		client.RegisterV1(Network("test"), scheme)
+		return client, func() int { return scheme.createCalls }, func() (PaymentPayloadView, error) {
+			payload, err := client.CreatePaymentPayloadV1(context.Background(), types.PaymentRequirementsV1{
+				Scheme:  "mock",
+				Network: "test",
+			})
+			return payload, err
+		}
+	}
+	newV2 := func() (*x402Client, func() int, func() (PaymentPayloadView, error)) {
+		scheme := &mockFailableV2{}
+		client := Newx402Client()
+		client.Register(Network("test"), scheme)
+		return client, func() int { return scheme.createCalls }, func() (PaymentPayloadView, error) {
+			payload, err := client.CreatePaymentPayload(context.Background(), types.PaymentRequirements{
+				Scheme:  "mock",
+				Network: "test",
+			}, nil, nil)
+			return payload, err
+		}
+	}
+
+	tests := []struct {
+		name             string
+		newClient        func() (*x402Client, func() int, func() (PaymentPayloadView, error))
+		recoveredPayload PaymentPayloadView
+	}{
+		{
+			name:      "V1",
+			newClient: newV1,
+			recoveredPayload: types.PaymentPayloadV1{
+				X402Version: 1,
+				Scheme:      "mock",
+				Network:     "test",
+				Payload:     map[string]interface{}{"recovered": true},
+			},
+		},
+		{
+			name:      "V2",
+			newClient: newV2,
+			recoveredPayload: types.PaymentPayload{
+				X402Version: 2,
+				Accepted:    types.PaymentRequirements{Scheme: "mock", Network: "test"},
+				Payload:     map[string]interface{}{"recovered": true},
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			for _, shouldRecover := range []bool{false, true} {
+				name := "returns hook error when not recovered"
+				if shouldRecover {
+					name = "returns recovered payload without recreating payment"
+				}
+				t.Run(name, func(t *testing.T) {
+					client, createCalls, create := tt.newClient()
+					hookErr := errors.New("after payment creation failed")
+					failureHookCalls := 0
+					var failureCtx PaymentCreationFailureContext
+					client.OnAfterPaymentCreation(func(PaymentCreatedContext) error {
+						return hookErr
+					})
+					client.OnPaymentCreationFailure(func(ctx PaymentCreationFailureContext) (*PaymentCreationFailureHookResult, error) {
+						failureHookCalls++
+						failureCtx = ctx
+						if shouldRecover {
+							return &PaymentCreationFailureHookResult{Recovered: true, Payload: tt.recoveredPayload}, nil
+						}
+						return nil, nil
+					})
+
+					payload, err := create()
+					require.Equal(t, 1, createCalls(), "the scheme payload must only be created once")
+					require.Equal(t, 1, failureHookCalls)
+					require.ErrorIs(t, failureCtx.Error, hookErr)
+					if shouldRecover {
+						require.NoError(t, err)
+						require.Equal(t, tt.recoveredPayload, payload)
+					} else {
+						require.ErrorIs(t, err, hookErr)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestAfterPaymentCreationHookErrorSkipsSchemeFailureHandler(t *testing.T) {
+	scheme := &mockCreationFailureHandlerV2{}
+	client := Newx402Client()
+	client.Register(Network("test"), scheme)
+	hookErr := errors.New("after payment creation failed")
+	client.OnAfterPaymentCreation(func(PaymentCreatedContext) error {
+		return hookErr
+	})
+	client.OnPaymentCreationFailure(func(PaymentCreationFailureContext) (*PaymentCreationFailureHookResult, error) {
+		return nil, nil
+	})
+
+	_, err := client.CreatePaymentPayload(context.Background(), types.PaymentRequirements{
+		Scheme:  "mock",
+		Network: "test",
+	}, nil, nil)
+
+	require.ErrorIs(t, err, hookErr)
+	require.Equal(t, 1, scheme.createCalls)
+	require.Zero(t, scheme.failureHandlerCalls, "a successfully built payload should not trigger the scheme build-failure handler")
 }
 
 // mergeExtensions must preserve server-declared fields while letting clients add

@@ -1,0 +1,6 @@
+kind: fixed
+body: >-
+  Return errors from after-payment-creation hooks and pass them to the
+  payment-creation failure hooks for recovery. The payment payload is created
+  only once; a hook error does not retry or undo that creation.
+time: 2026-10-13T20:00:00-04:00

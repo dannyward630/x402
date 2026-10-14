@@ -215,6 +215,40 @@ func paymentRequiredFromContext(ctx context.Context) (types.PaymentRequired, boo
 	return required, ok
 }
 
+func typedRecoveredPayload[T any](payload any, recovered bool) (T, bool) {
+	var zero T
+	if !recovered || payload == nil {
+		return zero, false
+	}
+	typed, ok := payload.(T)
+	return typed, ok
+}
+
+// recoverCreationFailureHooks runs user hooks. The first recovered payload of
+// type T wins; a recovered payload of another type is skipped.
+func recoverCreationFailureHooks[T any](
+	c *x402Client,
+	ctx context.Context,
+	failureCtx PaymentCreationFailureContext,
+) (T, bool, error) {
+	var zero T
+	if required, ok := paymentRequiredFromContext(ctx); ok {
+		failureCtx.PaymentRequired = &required
+	}
+	for _, hook := range c.onPaymentCreationFailureHooks {
+		result, err := hook(failureCtx)
+		if err != nil {
+			return zero, false, err
+		}
+		if result != nil {
+			if typed, ok := typedRecoveredPayload[T](result.Payload, result.Recovered); ok {
+				return typed, true, nil
+			}
+		}
+	}
+	return zero, false, nil
+}
+
 // recoverCreationFailure runs user hooks, then the scheme handler. The first
 // recovered payload of type T wins; a recovered payload of another type is skipped.
 func recoverCreationFailure[T any](
@@ -227,23 +261,9 @@ func recoverCreationFailure[T any](
 	if required, ok := paymentRequiredFromContext(ctx); ok {
 		failureCtx.PaymentRequired = &required
 	}
-	take := func(payload any, recovered bool) (T, bool) {
-		if !recovered || payload == nil {
-			return zero, false
-		}
-		typed, ok := payload.(T)
-		return typed, ok
-	}
-	for _, hook := range c.onPaymentCreationFailureHooks {
-		result, err := hook(failureCtx)
-		if err != nil {
-			return zero, false, err
-		}
-		if result != nil {
-			if typed, ok := take(result.Payload, result.Recovered); ok {
-				return typed, true, nil
-			}
-		}
+	recovered, recoveredOK, err := recoverCreationFailureHooks[T](c, ctx, failureCtx)
+	if err != nil || recoveredOK {
+		return recovered, recoveredOK, err
 	}
 	if handler, ok := scheme.(PaymentCreationFailureHandler); ok {
 		result, err := handler.OnPaymentCreationFailure(ctx, failureCtx)
@@ -251,7 +271,7 @@ func recoverCreationFailure[T any](
 			return zero, false, fmt.Errorf("scheme OnPaymentCreationFailure: %w", err)
 		}
 		if result != nil {
-			if typed, ok := take(result.Payload, result.Recovered); ok {
+			if typed, ok := typedRecoveredPayload[T](result.Payload, result.Recovered); ok {
 				return typed, true, nil
 			}
 		}
@@ -750,10 +770,23 @@ func (c *x402Client) CreatePaymentPayloadV1(
 	}
 
 	for _, hook := range c.afterPaymentCreationHooks {
-		_ = hook(PaymentCreatedContext{
+		hookErr := hook(PaymentCreatedContext{
 			PaymentCreationContext: creationCtxV1,
 			Payload:                payload,
 		})
+		if hookErr != nil {
+			recovered, recoveredOK, failureHookErr := recoverCreationFailureHooks[types.PaymentPayloadV1](c, ctx, PaymentCreationFailureContext{
+				PaymentCreationContext: creationCtxV1,
+				Error:                  hookErr,
+			})
+			if failureHookErr != nil {
+				return types.PaymentPayloadV1{}, failureHookErr
+			}
+			if recoveredOK {
+				return recovered, nil
+			}
+			return types.PaymentPayloadV1{}, hookErr
+		}
 	}
 	return payload, nil
 }
@@ -854,10 +887,23 @@ func (c *x402Client) CreatePaymentPayload(
 	}
 
 	for _, hook := range c.afterPaymentCreationHooks {
-		_ = hook(PaymentCreatedContext{
+		hookErr := hook(PaymentCreatedContext{
 			PaymentCreationContext: creationCtxV2,
 			Payload:                partial,
 		})
+		if hookErr != nil {
+			recovered, recoveredOK, failureHookErr := recoverCreationFailureHooks[types.PaymentPayload](c, ctx, PaymentCreationFailureContext{
+				PaymentCreationContext: creationCtxV2,
+				Error:                  hookErr,
+			})
+			if failureHookErr != nil {
+				return types.PaymentPayload{}, failureHookErr
+			}
+			if recoveredOK {
+				return recovered, nil
+			}
+			return types.PaymentPayload{}, hookErr
+		}
 	}
 	return partial, nil
 }
